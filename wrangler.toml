@@ -1,0 +1,15 @@
+name = "public-poto-api"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+kv_namespaces = [
+  { binding = "PHOTOS_KV", id = "3480ddc6086749f795a0e370be55641e" }
+]
+
+# Nama bucket R2 kamu: "photos-telehub"
+[[r2_buckets]]
+binding = "PHOTOS_BUCKET"
+bucket_name = "photos-telehub"
+
+[vars]
+ALLOWED_ORIGIN = "https://telehub.nfy.fyi"
