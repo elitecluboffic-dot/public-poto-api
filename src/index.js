@@ -2,12 +2,18 @@
  * Public Poto — Cloudflare Worker backend
  *
  * Bindings dibutuhkan (set di wrangler.toml / dashboard):
- *  - PHOTOS_KV       : KV namespace (metadata + index)
- *  - PHOTOS_BUCKET   : R2 bucket (file gambar)
- *  - ADMIN_TOKEN     : secret string (buat proteksi endpoint admin)
- *  - ALLOWED_ORIGIN  : origin frontend kamu, mis. "https://situskamu.com"
- *  - SIGNING_SECRET  : secret string BARU, khusus buat tanda tangan signed URL
- *                      (jangan sama dengan ADMIN_TOKEN, generate random panjang)
+ *  - PHOTOS_KV           : KV namespace (metadata + index)
+ *  - PHOTOS_BUCKET       : R2 bucket (file gambar)
+ *  - ADMIN_TOKEN          : secret string (buat proteksi endpoint admin)
+ *  - ALLOWED_ORIGIN       : origin frontend kamu, mis. "https://situskamu.com"
+ *  - RECAPTCHA_SECRET_KEY : secret string dari Google reCAPTCHA v2 (BARU! wajib ditambahin)
+ *
+ * Cara nambahin secret RECAPTCHA_SECRET_KEY:
+ *   wrangler secret put RECAPTCHA_SECRET_KEY
+ * (atau lewat dashboard Cloudflare: Worker -> Settings -> Variables -> Encrypt)
+ *
+ * PENTING: pakai secret key YANG BARU (di-regenerate), bukan yang lama yang
+ * pernah kelihatan di screenshot config.php. Anggap yang lama itu bocor.
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -18,7 +24,6 @@ const ALLOWED_TYPES = {
   'image/gif': 'gif',
 };
 const PAGE_SIZE_DEFAULT = 24;
-const SIGNED_URL_TTL_SECONDS = 120; // link foto valid 2 menit sejak /api/photos dipanggil
 
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
@@ -62,50 +67,33 @@ function newId() {
   return crypto.randomUUID().replace(/-/g, '');
 }
 
-// ---------- Signed URL helpers ----------
+// ---- Verifikasi Google reCAPTCHA v2 ----
+async function verifyRecaptcha(token, env, remoteIp) {
+  if (!env.RECAPTCHA_SECRET_KEY) {
+    // Kalau secret belum di-set di Worker, jangan diam-diam meloloskan request.
+    // Ini bikin error jelas ketimbang "captcha ternyata nggak pernah dicek".
+    return { success: false, error: 'server-misconfigured' };
+  }
+  if (!token || typeof token !== 'string') {
+    return { success: false, error: 'missing-input-response' };
+  }
 
-async function hmacKey(secret) {
-  const enc = new TextEncoder();
-  return crypto.subtle.importKey(
-    'raw',
-    enc.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign', 'verify']
-  );
-}
+  const params = new URLSearchParams();
+  params.set('secret', env.RECAPTCHA_SECRET_KEY);
+  params.set('response', token);
+  if (remoteIp) params.set('remoteip', remoteIp);
 
-function toHex(buf) {
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-async function signFilename(env, filename, exp) {
-  const key = await hmacKey(env.SIGNING_SECRET);
-  const enc = new TextEncoder();
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${filename}:${exp}`));
-  return toHex(sig);
-}
-
-async function verifyFilenameSig(env, filename, exp, sig) {
-  if (!exp || !sig) return false;
-  if (Date.now() / 1000 > Number(exp)) return false; // expired
-  const expected = await signFilename(env, filename, exp);
-  // perbandingan sederhana; panjang string tetap (hex sha256) jadi risiko timing attack rendah untuk kasus ini
-  return expected === sig;
-}
-
-async function buildSignedUrl(env, requestUrl, filename) {
-  const exp = Math.floor(Date.now() / 1000) + SIGNED_URL_TTL_SECONDS;
-  const sig = await signFilename(env, filename, exp);
-  const origin = new URL(requestUrl).origin;
-  return `${origin}/photos/${filename}?exp=${exp}&sig=${sig}`;
-}
-
-async function attachSignedUrls(env, requestUrl, photos) {
-  return Promise.all(photos.map(async p => ({
-    ...p,
-    url: await buildSignedUrl(env, requestUrl, p.filename),
-  })));
+  try {
+    const res = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const data = await res.json();
+    return data; // { success: bool, 'error-codes': [...] , ... }
+  } catch (err) {
+    return { success: false, error: 'verify-request-failed' };
+  }
 }
 
 export default {
@@ -125,8 +113,7 @@ export default {
         const limit = Math.min(48, Math.max(1, parseInt(url.searchParams.get('limit') || String(PAGE_SIZE_DEFAULT), 10)));
         const index = await getIndex(env, 'approved');
         const page = index.slice(offset, offset + limit);
-        const signedPage = await attachSignedUrls(env, request.url, page);
-        return json({ photos: signedPage, total: index.length }, 200, cors);
+        return json({ photos: page, total: index.length }, 200, cors);
       }
 
       // ---- Public: upload a new photo (goes in as pending) ----
@@ -140,6 +127,14 @@ export default {
         const file = form.get('photo');
         const title = (form.get('title') || '').toString().slice(0, 150).trim();
         const uploaderName = (form.get('uploader_name') || '').toString().slice(0, 100).trim();
+        const captchaToken = (form.get('g-recaptcha-response') || '').toString();
+
+        // ---- Verifikasi captcha DULU, sebelum sentuh file / R2 / KV ----
+        const remoteIp = request.headers.get('CF-Connecting-IP') || '';
+        const captchaResult = await verifyRecaptcha(captchaToken, env, remoteIp);
+        if (!captchaResult.success) {
+          return json({ ok: false, error: 'Verifikasi captcha gagal. Silakan coba lagi.' }, 400, cors);
+        }
 
         if (!file || typeof file === 'string') {
           return json({ ok: false, error: 'File foto tidak ditemukan.' }, 400, cors);
@@ -169,7 +164,7 @@ export default {
           status: 'pending',
           uploaded_at: now,
           approved_at: null,
-          ip: request.headers.get('CF-Connecting-IP') || null,
+          ip: remoteIp || null,
         };
         await env.PHOTOS_KV.put(`photo:${id}`, JSON.stringify(record));
 
@@ -180,37 +175,15 @@ export default {
         return json({ ok: true }, 200, cors);
       }
 
-      // ---- Public: serve an image from R2 (butuh signed sig+exp yang valid) ----
+      // ---- Public: serve an image from R2 ----
       const imgMatch = path.match(/^\/photos\/([a-f0-9]+\.(jpg|png|webp|gif))$/);
       if (imgMatch && request.method === 'GET') {
-        const filename = imgMatch[1];
-        const exp = url.searchParams.get('exp');
-        const sig = url.searchParams.get('sig');
-
-        const validSig = await verifyFilenameSig(env, filename, exp, sig);
-        if (!validSig) {
-          return json({ ok: false, error: 'Link foto tidak valid atau sudah kedaluwarsa.' }, 403, cors);
-        }
-
-        // Referer check tambahan: tolak kalau diakses langsung dari luar situs
-        // (opsional, bisa dilonggarkan kalau perlu dibuka lewat WhatsApp preview dll)
-        const referer = request.headers.get('Referer') || '';
-        const allowedOrigins = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim());
-        const refererOk = allowedOrigins.some(o => o && referer.startsWith(o));
-        if (!refererOk) {
-          return json({ ok: false, error: 'Akses ditolak.' }, 403, cors);
-        }
-
-        const object = await env.PHOTOS_BUCKET.get(`photos/${filename}`);
+        const object = await env.PHOTOS_BUCKET.get(`photos/${imgMatch[1]}`);
         if (!object) return new Response('Not found', { status: 404, headers: cors });
-
         return new Response(object.body, {
           headers: {
             'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
-            'Content-Disposition': 'inline',
-            // signed URL expire cepat, jadi jangan cache lama & jangan immutable
-            'Cache-Control': `private, max-age=${SIGNED_URL_TTL_SECONDS}`,
-            'X-Content-Type-Options': 'nosniff',
+            'Cache-Control': 'public, max-age=31536000, immutable',
             ...cors,
           },
         });
@@ -229,8 +202,7 @@ export default {
             return json({ ok: false, error: 'Status tidak valid.' }, 400, cors);
           }
           const index = await getIndex(env, status);
-          const signedIndex = await attachSignedUrls(env, request.url, index);
-          return json({ ok: true, photos: signedIndex }, 200, cors);
+          return json({ ok: true, photos: index }, 200, cors);
         }
 
         // counts for tab badges
