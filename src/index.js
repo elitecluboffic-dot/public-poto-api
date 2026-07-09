@@ -2,10 +2,12 @@
  * Public Poto — Cloudflare Worker backend
  *
  * Bindings dibutuhkan (set di wrangler.toml / dashboard):
- *  - PHOTOS_KV     : KV namespace (metadata + index)
- *  - PHOTOS_BUCKET : R2 bucket (file gambar)
- *  - ADMIN_TOKEN    : secret string (buat proteksi endpoint admin)
- *  - ALLOWED_ORIGIN : origin frontend kamu, mis. "https://situskamu.com"
+ *  - PHOTOS_KV       : KV namespace (metadata + index)
+ *  - PHOTOS_BUCKET   : R2 bucket (file gambar)
+ *  - ADMIN_TOKEN     : secret string (buat proteksi endpoint admin)
+ *  - ALLOWED_ORIGIN  : origin frontend kamu, mis. "https://situskamu.com"
+ *  - SIGNING_SECRET  : secret string BARU, khusus buat tanda tangan signed URL
+ *                      (jangan sama dengan ADMIN_TOKEN, generate random panjang)
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -16,6 +18,7 @@ const ALLOWED_TYPES = {
   'image/gif': 'gif',
 };
 const PAGE_SIZE_DEFAULT = 24;
+const SIGNED_URL_TTL_SECONDS = 120; // link foto valid 2 menit sejak /api/photos dipanggil
 
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
@@ -59,6 +62,52 @@ function newId() {
   return crypto.randomUUID().replace(/-/g, '');
 }
 
+// ---------- Signed URL helpers ----------
+
+async function hmacKey(secret) {
+  const enc = new TextEncoder();
+  return crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
+}
+
+function toHex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function signFilename(env, filename, exp) {
+  const key = await hmacKey(env.SIGNING_SECRET);
+  const enc = new TextEncoder();
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${filename}:${exp}`));
+  return toHex(sig);
+}
+
+async function verifyFilenameSig(env, filename, exp, sig) {
+  if (!exp || !sig) return false;
+  if (Date.now() / 1000 > Number(exp)) return false; // expired
+  const expected = await signFilename(env, filename, exp);
+  // perbandingan sederhana; panjang string tetap (hex sha256) jadi risiko timing attack rendah untuk kasus ini
+  return expected === sig;
+}
+
+async function buildSignedUrl(env, requestUrl, filename) {
+  const exp = Math.floor(Date.now() / 1000) + SIGNED_URL_TTL_SECONDS;
+  const sig = await signFilename(env, filename, exp);
+  const origin = new URL(requestUrl).origin;
+  return `${origin}/photos/${filename}?exp=${exp}&sig=${sig}`;
+}
+
+async function attachSignedUrls(env, requestUrl, photos) {
+  return Promise.all(photos.map(async p => ({
+    ...p,
+    url: await buildSignedUrl(env, requestUrl, p.filename),
+  })));
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -76,7 +125,8 @@ export default {
         const limit = Math.min(48, Math.max(1, parseInt(url.searchParams.get('limit') || String(PAGE_SIZE_DEFAULT), 10)));
         const index = await getIndex(env, 'approved');
         const page = index.slice(offset, offset + limit);
-        return json({ photos: page, total: index.length }, 200, cors);
+        const signedPage = await attachSignedUrls(env, request.url, page);
+        return json({ photos: signedPage, total: index.length }, 200, cors);
       }
 
       // ---- Public: upload a new photo (goes in as pending) ----
@@ -130,15 +180,37 @@ export default {
         return json({ ok: true }, 200, cors);
       }
 
-      // ---- Public: serve an image from R2 ----
+      // ---- Public: serve an image from R2 (butuh signed sig+exp yang valid) ----
       const imgMatch = path.match(/^\/photos\/([a-f0-9]+\.(jpg|png|webp|gif))$/);
       if (imgMatch && request.method === 'GET') {
-        const object = await env.PHOTOS_BUCKET.get(`photos/${imgMatch[1]}`);
+        const filename = imgMatch[1];
+        const exp = url.searchParams.get('exp');
+        const sig = url.searchParams.get('sig');
+
+        const validSig = await verifyFilenameSig(env, filename, exp, sig);
+        if (!validSig) {
+          return json({ ok: false, error: 'Link foto tidak valid atau sudah kedaluwarsa.' }, 403, cors);
+        }
+
+        // Referer check tambahan: tolak kalau diakses langsung dari luar situs
+        // (opsional, bisa dilonggarkan kalau perlu dibuka lewat WhatsApp preview dll)
+        const referer = request.headers.get('Referer') || '';
+        const allowedOrigins = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim());
+        const refererOk = allowedOrigins.some(o => o && referer.startsWith(o));
+        if (!refererOk) {
+          return json({ ok: false, error: 'Akses ditolak.' }, 403, cors);
+        }
+
+        const object = await env.PHOTOS_BUCKET.get(`photos/${filename}`);
         if (!object) return new Response('Not found', { status: 404, headers: cors });
+
         return new Response(object.body, {
           headers: {
             'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
-            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Content-Disposition': 'inline',
+            // signed URL expire cepat, jadi jangan cache lama & jangan immutable
+            'Cache-Control': `private, max-age=${SIGNED_URL_TTL_SECONDS}`,
+            'X-Content-Type-Options': 'nosniff',
             ...cors,
           },
         });
@@ -157,7 +229,8 @@ export default {
             return json({ ok: false, error: 'Status tidak valid.' }, 400, cors);
           }
           const index = await getIndex(env, status);
-          return json({ ok: true, photos: index }, 200, cors);
+          const signedIndex = await attachSignedUrls(env, request.url, index);
+          return json({ ok: true, photos: signedIndex }, 200, cors);
         }
 
         // counts for tab badges
