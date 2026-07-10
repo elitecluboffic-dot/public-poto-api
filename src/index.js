@@ -29,13 +29,23 @@
  * ---- Cara kerja auto-moderasi ----
  * Setiap upload yang lolos captcha & validasi dasar (tipe file, ukuran) akan
  * dikirim ke model vision Moondream 3.1 (@cf/moondream/moondream3.1-9B-A2B) di
- * Workers AI dengan pertanyaan sederhana: apakah gambar ini aman buat galeri
- * foto publik yang family-friendly?
- *   - Kalau model jawab "SAFE"   -> foto langsung masuk status "approved"
- *   - Kalau model jawab "UNSAFE" -> foto langsung masuk status "rejected"
- *   - Kalau model error / jawaban ambigu -> foto FALLBACK ke "pending" (fail-safe,
+ * Workers AI dengan pertanyaan: apakah gambar ini aman buat galeri foto publik
+ * yang family-friendly, plus minta alasan singkat (di bawah 15 kata).
+ *   - Kalau model jawab "VERDICT: SAFE"   -> foto langsung masuk status "approved"
+ *   - Kalau model jawab "VERDICT: UNSAFE" -> foto langsung masuk status "rejected"
+ *   - Kalau model error / jawaban ambigu  -> foto FALLBACK ke "pending" (fail-safe,
  *     supaya kalau AI-nya lagi bermasalah, konten nggak lolos begitu aja tanpa
  *     ada yang cek)
+ * Alasan singkat dari model disimpan di field `moderation_reason` tiap record,
+ * jadi admin bisa lihat KENAPA suatu foto ditolak/disetujui, bukan cuma label.
+ *
+ * File foto SELALU disimpan ke R2, termasuk yang berstatus "rejected" -- ini
+ * supaya admin bisa buka & lihat gambarnya sendiri buat verifikasi manual kalau
+ * curiga AI-nya salah tebak (false positive). Foto berstatus "rejected" TIDAK
+ * PERNAH otomatis tampil ke publik (endpoint /api/photos cuma nampilin yang
+ * "approved"), jadi ini aman dari sisi publik. Kalau nanti storage jadi
+ * perhatian, admin bisa hapus manual foto "rejected" yang numpuk lewat tombol
+ * Hapus di panel admin.
  * Admin tetap bisa override manual kapan aja lewat endpoint /api/admin/photos/:id/:action,
  * apa pun status hasil auto-moderasinya.
  */
@@ -53,7 +63,10 @@ const MODERATION_QUESTION =
   "Look at this image carefully. Would this image be considered inappropriate for a " +
   "public, family-friendly photo gallery website? Consider nudity, sexual content, " +
   "graphic violence, gore, hate symbols, or other clearly unsafe content. " +
-  "Reply with exactly one word, either SAFE or UNSAFE. Do not explain.";
+  "Respond in exactly this format on one line: VERDICT: SAFE or VERDICT: UNSAFE, " +
+  "followed by a short reason in under 15 words. " +
+  "Example: 'VERDICT: SAFE - a landscape photo with no people or unsafe content.' " +
+  "Example: 'VERDICT: UNSAFE - contains visible nudity.'";
 
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
@@ -171,7 +184,8 @@ async function moderateImage(env, bytes, mimeType) {
     // jawabannya ada di result.result.answer, bukan result.answer langsung.
     // Bentuk lengkapnya: { result: { answer, caption, finish_reason, ... }, usage: {...} }
     const inner = (result && result.result) ? result.result : result;
-    const answer = (inner && inner.answer ? String(inner.answer) : '').trim().toUpperCase();
+    const rawAnswer = (inner && inner.answer ? String(inner.answer) : '').trim();
+    const answer = rawAnswer.toUpperCase();
 
     // Kalau jawabannya kosong DAN generation-nya kepotong karena kehabisan token,
     // catat itu spesifik di reason -- bukan cuma "ambiguous" -- biar ke-diagnosa
@@ -180,14 +194,25 @@ async function moderateImage(env, bytes, mimeType) {
       return { status: 'pending', reason: 'ai-truncated-max-tokens-too-low' };
     }
 
+    // Ambil bagian alasan singkat yang ditulis model setelah "VERDICT: SAFE/UNSAFE"
+    // (biasanya dipisah tanda "-"), biar bisa ditampilin ke admin -- bukan cuma
+    // label "unsafe" doang tanpa konteks kenapa.
+    function extractReasonText(text) {
+      const dashIdx = text.indexOf('-');
+      const reasonPart = dashIdx !== -1 ? text.slice(dashIdx + 1) : text;
+      return reasonPart.trim().replace(/\s+/g, ' ').slice(0, 150);
+    }
+
     if (answer.includes('UNSAFE')) {
-      return { status: 'rejected', reason: 'ai-flagged-unsafe' };
+      const why = extractReasonText(rawAnswer) || 'tidak ada alasan spesifik dari AI';
+      return { status: 'rejected', reason: `ai-flagged-unsafe: ${why}` };
     }
     if (answer.includes('SAFE')) {
-      return { status: 'approved', reason: 'ai-flagged-safe' };
+      const why = extractReasonText(rawAnswer) || 'tidak ada alasan spesifik dari AI';
+      return { status: 'approved', reason: `ai-flagged-safe: ${why}` };
     }
     // Jawaban ambigu -> jangan asal loloskan, kirim ke antrian manual.
-    return { status: 'pending', reason: `ai-ambiguous-answer:${answer.slice(0, 40)}` };
+    return { status: 'pending', reason: `ai-ambiguous-answer:${answer.slice(0, 80)}` };
   } catch (err) {
     return { status: 'pending', reason: 'ai-error:' + err.message };
   }
@@ -248,18 +273,20 @@ export default {
         const filename = `${id}.${ext}`;
         const bytes = new Uint8Array(await file.arrayBuffer());
 
-        // ---- Auto-moderasi AI sebelum foto disimpan permanen ----
+        // ---- Auto-moderasi AI sebelum foto ditampilin publik ----
         const moderation = await moderateImage(env, bytes, file.type);
 
-        // Kalau ditolak AI, jangan simpan sama sekali ke R2 -- cukup dicatat
-        // statusnya "rejected" tanpa file fisik biar hemat storage & nggak
-        // nyimpen konten yang udah jelas kena flag.
-        const shouldStoreFile = moderation.status !== 'rejected';
-        if (shouldStoreFile) {
-          await env.PHOTOS_BUCKET.put(`photos/${filename}`, bytes, {
-            httpMetadata: { contentType: file.type },
-          });
-        }
+        // File TETAP disimpan meskipun ditolak AI -- ini penting biar admin bisa
+        // buka & lihat sendiri gambarnya di tab "Ditolak" buat verifikasi manual
+        // (mengoreksi false positive). Foto yang ditolak TIDAK pernah otomatis
+        // tampil ke publik (endpoint /api/photos cuma nampilin yang "approved"),
+        // jadi menyimpannya sementara di sini aman dari sisi publik.
+        // Catatan: ini nambah pemakaian storage R2 dibanding sebelumnya -- kalau
+        // suatu saat mau balik ke perilaku "jangan simpan yang ditolak", admin
+        // bisa hapus manual foto yang statusnya "rejected" lewat tombol Hapus.
+        await env.PHOTOS_BUCKET.put(`photos/${filename}`, bytes, {
+          httpMetadata: { contentType: file.type },
+        });
 
         const now = new Date().toISOString();
         const record = {
@@ -272,7 +299,7 @@ export default {
           approved_at: moderation.status === 'approved' ? now : null,
           ip: remoteIp || null,
           moderation_reason: moderation.reason,
-          has_file: shouldStoreFile,
+          has_file: true,
         };
         await env.PHOTOS_KV.put(`photo:${id}`, JSON.stringify(record));
 
