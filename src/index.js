@@ -157,13 +157,24 @@ async function moderateImage(env, bytes, mimeType) {
       task: 'query',
       image: dataUri,
       question: MODERATION_QUESTION,
-      reasoning: false,
-      max_tokens: 16,
-      stream: false,
+      reasoning: false, // matikan reasoning trace, kita cuma butuh jawaban akhir
+      max_tokens: 64,    // PENTING: jangan diset terlalu kecil (mis. 16) -- itu bikin
+                          // jawaban kepotong sebelum sempat nulis SAFE/UNSAFE sama
+                          // sekali, hasilnya field `answer` balik kosong. Default
+                          // resmi model ini 8192; 64 udah lebih dari cukup buat
+                          // satu kata jawaban + sedikit toleransi.
+      stream: false,     // default true di API-nya, kita matikan biar respons langsung utuh
       temperature: 0,
     });
 
     const answer = (result && result.answer ? String(result.answer) : '').trim().toUpperCase();
+
+    // Kalau jawabannya kosong DAN generation-nya kepotong karena kehabisan token,
+    // catat itu spesifik di reason -- bukan cuma "ambiguous" -- biar ke-diagnosa
+    // lebih cepat kalau ini kejadian lagi.
+    if (!answer && result && result.finish_reason === 'length') {
+      return { status: 'pending', reason: 'ai-truncated-max-tokens-too-low' };
+    }
 
     if (answer.includes('UNSAFE')) {
       return { status: 'rejected', reason: 'ai-flagged-unsafe' };
