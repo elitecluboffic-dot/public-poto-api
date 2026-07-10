@@ -60,13 +60,19 @@ const ALLOWED_TYPES = {
 const PAGE_SIZE_DEFAULT = 24;
 const MODERATION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const MODERATION_QUESTION =
-  "Look at this image carefully. Would this image be considered inappropriate for a " +
-  "public, family-friendly photo gallery website? Consider nudity, sexual content, " +
-  "graphic violence, gore, hate symbols, or other clearly unsafe content. " +
+  "Look at this image carefully. This gallery accepts digital/AI-generated art, including " +
+  "fantasy, surreal, and ethereal styles that often feature stylized humanoid figures, " +
+  "silhouettes, or non-explicit artistic nudity (e.g. a glowing spirit figure, a distant " +
+  "silhouette, tasteful artistic nude poses without visible genitals or sexual acts). " +
+  "That kind of stylized/artistic content is ALLOWED and should be marked SAFE. " +
+  "Only mark UNSAFE if the image contains: explicit/pornographic sexual content, clearly " +
+  "visible genitals or sexual acts, graphic violence or gore, hate symbols, or content " +
+  "sexualizing minors. When in doubt between 'artistic' and 'explicit', lean toward SAFE " +
+  "unless it is clearly explicit. " +
   "Respond in exactly this format on one line: VERDICT: SAFE or VERDICT: UNSAFE, " +
   "followed by a short reason in under 15 words. " +
-  "Example: 'VERDICT: SAFE - a landscape photo with no people or unsafe content.' " +
-  "Example: 'VERDICT: UNSAFE - contains visible nudity.'";
+  "Example: 'VERDICT: SAFE - stylized fantasy figure, no explicit content.' " +
+  "Example: 'VERDICT: UNSAFE - explicit sexual content clearly visible.'";
 
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
