@@ -176,6 +176,20 @@ async function moderateImage(env, bytes, mimeType) {
       return { status: 'pending', reason: 'ai-truncated-max-tokens-too-low' };
     }
 
+    // DEBUG SEMENTARA: kalau jawaban kosong/ambigu, simpen mentahan hasil
+    // dari AI ke reason (dipotong biar nggak kepanjangan) -- ini buat
+    // ketahuan persis struktur JSON yang beneran dibalikin modelnya,
+    // soalnya field 'answer' ternyata nggak selalu keisi sesuai dugaan.
+    if (!answer || (!answer.includes('SAFE') && !answer.includes('UNSAFE'))) {
+      let raw;
+      try {
+        raw = JSON.stringify(result);
+      } catch (e) {
+        raw = String(result);
+      }
+      return { status: 'pending', reason: 'ai-debug-raw:' + (raw || '').slice(0, 400) };
+    }
+
     if (answer.includes('UNSAFE')) {
       return { status: 'rejected', reason: 'ai-flagged-unsafe' };
     }
