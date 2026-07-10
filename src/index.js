@@ -4,16 +4,40 @@
  * Bindings dibutuhkan (set di wrangler.toml / dashboard):
  *  - PHOTOS_KV           : KV namespace (metadata + index)
  *  - PHOTOS_BUCKET       : R2 bucket (file gambar)
+ *  - AI                    : Workers AI binding (BARU! wajib buat auto-moderasi)
  *  - ADMIN_TOKEN          : secret string (buat proteksi endpoint admin)
  *  - ALLOWED_ORIGIN       : origin frontend kamu, mis. "https://situskamu.com"
- *  - RECAPTCHA_SECRET_KEY : secret string dari Google reCAPTCHA v2 (BARU! wajib ditambahin)
+ *  - RECAPTCHA_SECRET_KEY : secret string dari Google reCAPTCHA v2
+ *  - AUTO_MODERATION       : "on" / "off" (var biasa, bukan secret). Kalau "off"
+ *                            atau nggak di-set, semua upload tetap masuk "pending"
+ *                            seperti sebelumnya (perilaku lama, aman sebagai default).
+ *
+ * Cara nambahin binding AI (Workers AI) di wrangler.toml:
+ *   [ai]
+ *   binding = "AI"
  *
  * Cara nambahin secret RECAPTCHA_SECRET_KEY:
  *   wrangler secret put RECAPTCHA_SECRET_KEY
- * (atau lewat dashboard Cloudflare: Worker -> Settings -> Variables -> Encrypt)
+ *
+ * Cara nyalain auto-moderasi:
+ *   wrangler.toml -> [vars] -> AUTO_MODERATION = "on"
+ *   (atau di dashboard: Worker -> Settings -> Variables -> Text)
  *
  * PENTING: pakai secret key YANG BARU (di-regenerate), bukan yang lama yang
  * pernah kelihatan di screenshot config.php. Anggap yang lama itu bocor.
+ *
+ * ---- Cara kerja auto-moderasi ----
+ * Setiap upload yang lolos captcha & validasi dasar (tipe file, ukuran) akan
+ * dikirim ke model vision Moondream 3.1 (@cf/moondream/moondream3.1-9B-A2B) di
+ * Workers AI dengan pertanyaan sederhana: apakah gambar ini aman buat galeri
+ * foto publik yang family-friendly?
+ *   - Kalau model jawab "SAFE"   -> foto langsung masuk status "approved"
+ *   - Kalau model jawab "UNSAFE" -> foto langsung masuk status "rejected"
+ *   - Kalau model error / jawaban ambigu -> foto FALLBACK ke "pending" (fail-safe,
+ *     supaya kalau AI-nya lagi bermasalah, konten nggak lolos begitu aja tanpa
+ *     ada yang cek)
+ * Admin tetap bisa override manual kapan aja lewat endpoint /api/admin/photos/:id/:action,
+ * apa pun status hasil auto-moderasinya.
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -24,6 +48,12 @@ const ALLOWED_TYPES = {
   'image/gif': 'gif',
 };
 const PAGE_SIZE_DEFAULT = 24;
+const MODERATION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
+const MODERATION_QUESTION =
+  "Look at this image carefully. Would this image be considered inappropriate for a " +
+  "public, family-friendly photo gallery website? Consider nudity, sexual content, " +
+  "graphic violence, gore, hate symbols, or other clearly unsafe content. " +
+  "Reply with exactly one word, either SAFE or UNSAFE. Do not explain.";
 
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
@@ -67,6 +97,17 @@ function newId() {
   return crypto.randomUUID().replace(/-/g, '');
 }
 
+function bytesToBase64(bytes) {
+  // Convert dalam chunk biar nggak kena limit argumen String.fromCharCode
+  // buat file gambar yang cukup besar (sampai 5MB).
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 // ---- Verifikasi Google reCAPTCHA v2 ----
 async function verifyRecaptcha(token, env, remoteIp) {
   if (!env.RECAPTCHA_SECRET_KEY) {
@@ -96,6 +137,47 @@ async function verifyRecaptcha(token, env, remoteIp) {
   }
 }
 
+// ---- Auto-moderasi pakai Workers AI (Moondream 3.1) ----
+// Return: { status: 'approved' | 'rejected' | 'pending', reason: string }
+// 'pending' dipakai sebagai fallback aman kalau AI error / jawaban nggak jelas,
+// atau kalau AUTO_MODERATION lagi dimatikan.
+async function moderateImage(env, bytes, mimeType) {
+  if ((env.AUTO_MODERATION || '').toLowerCase() !== 'on') {
+    return { status: 'pending', reason: 'auto-moderation-disabled' };
+  }
+  if (!env.AI) {
+    return { status: 'pending', reason: 'ai-binding-missing' };
+  }
+
+  try {
+    const base64 = bytesToBase64(bytes);
+    const dataUri = `data:${mimeType};base64,${base64}`;
+
+    const result = await env.AI.run(MODERATION_MODEL, {
+      task: 'query',
+      image: dataUri,
+      question: MODERATION_QUESTION,
+      reasoning: false,
+      max_tokens: 16,
+      stream: false,
+      temperature: 0,
+    });
+
+    const answer = (result && result.answer ? String(result.answer) : '').trim().toUpperCase();
+
+    if (answer.includes('UNSAFE')) {
+      return { status: 'rejected', reason: 'ai-flagged-unsafe' };
+    }
+    if (answer.includes('SAFE')) {
+      return { status: 'approved', reason: 'ai-flagged-safe' };
+    }
+    // Jawaban ambigu -> jangan asal loloskan, kirim ke antrian manual.
+    return { status: 'pending', reason: `ai-ambiguous-answer:${answer.slice(0, 40)}` };
+  } catch (err) {
+    return { status: 'pending', reason: 'ai-error:' + err.message };
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -116,7 +198,7 @@ export default {
         return json({ photos: page, total: index.length }, 200, cors);
       }
 
-      // ---- Public: upload a new photo (goes in as pending) ----
+      // ---- Public: upload a new photo (auto-approve / auto-reject / pending) ----
       if (path === '/api/upload' && request.method === 'POST') {
         const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
         if (contentLength && contentLength > MAX_BYTES + 200_000) {
@@ -149,11 +231,20 @@ export default {
 
         const id = newId();
         const filename = `${id}.${ext}`;
-        const bytes = await file.arrayBuffer();
+        const bytes = new Uint8Array(await file.arrayBuffer());
 
-        await env.PHOTOS_BUCKET.put(`photos/${filename}`, bytes, {
-          httpMetadata: { contentType: file.type },
-        });
+        // ---- Auto-moderasi AI sebelum foto disimpan permanen ----
+        const moderation = await moderateImage(env, bytes, file.type);
+
+        // Kalau ditolak AI, jangan simpan sama sekali ke R2 -- cukup dicatat
+        // statusnya "rejected" tanpa file fisik biar hemat storage & nggak
+        // nyimpen konten yang udah jelas kena flag.
+        const shouldStoreFile = moderation.status !== 'rejected';
+        if (shouldStoreFile) {
+          await env.PHOTOS_BUCKET.put(`photos/${filename}`, bytes, {
+            httpMetadata: { contentType: file.type },
+          });
+        }
 
         const now = new Date().toISOString();
         const record = {
@@ -161,18 +252,20 @@ export default {
           filename,
           title: title || null,
           uploader_name: uploaderName || null,
-          status: 'pending',
+          status: moderation.status, // 'approved' | 'rejected' | 'pending'
           uploaded_at: now,
-          approved_at: null,
+          approved_at: moderation.status === 'approved' ? now : null,
           ip: remoteIp || null,
+          moderation_reason: moderation.reason,
+          has_file: shouldStoreFile,
         };
         await env.PHOTOS_KV.put(`photo:${id}`, JSON.stringify(record));
 
-        const pending = await getIndex(env, 'pending');
-        pending.unshift(record);
-        await setIndex(env, 'pending', pending);
+        const targetIndex = await getIndex(env, moderation.status);
+        targetIndex.unshift(record);
+        await setIndex(env, moderation.status, targetIndex);
 
-        return json({ ok: true }, 200, cors);
+        return json({ ok: true, status: moderation.status }, 200, cors);
       }
 
       // ---- Public: serve an image from R2 ----
@@ -230,7 +323,9 @@ export default {
           }
 
           if (action === 'delete') {
-            await env.PHOTOS_BUCKET.delete(`photos/${record.filename}`);
+            if (record.has_file !== false) {
+              await env.PHOTOS_BUCKET.delete(`photos/${record.filename}`);
+            }
             await env.PHOTOS_KV.delete(`photo:${id}`);
             return json({ ok: true }, 200, cors);
           }
