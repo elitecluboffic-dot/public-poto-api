@@ -11,5 +11,11 @@ kv_namespaces = [
 binding = "PHOTOS_BUCKET"
 bucket_name = "photos-telehub"
 
+# Binding buat Workers AI (dipakai buat auto-moderasi foto upload)
+[ai]
+binding = "AI"
+
 [vars]
 ALLOWED_ORIGIN = "https://telehub.nfy.fyi"
+# "on" = auto-approve/auto-reject aktif, "off" = semua upload masuk pending (perilaku lama)
+AUTO_MODERATION = "on"
