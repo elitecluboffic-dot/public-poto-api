@@ -2,9 +2,9 @@
  * Public Poto — Cloudflare Worker backend
  *
  * Bindings dibutuhkan (set di wrangler.toml / dashboard):
- *  - PHOTOS_KV           : KV namespace (metadata + index)
+ *  - PHOTOS_KV           : KV namespace (metadata + index + rate limit counter)
  *  - PHOTOS_BUCKET       : R2 bucket (file gambar)
- *  - AI                    : Workers AI binding (BARU! wajib buat auto-moderasi)
+ *  - AI                    : Workers AI binding (wajib buat auto-moderasi)
  *  - ADMIN_TOKEN          : secret string (buat proteksi endpoint admin)
  *  - ALLOWED_ORIGIN       : origin frontend kamu, mis. "https://situskamu.com"
  *  - RECAPTCHA_SECRET_KEY : secret string dari Google reCAPTCHA v2
@@ -48,6 +48,30 @@
  * Hapus di panel admin.
  * Admin tetap bisa override manual kapan aja lewat endpoint /api/admin/photos/:id/:action,
  * apa pun status hasil auto-moderasinya.
+ *
+ * ---- Rate limit upload per IP (BARU) ----
+ * Setiap IP cuma boleh upload maksimal MAX_UPLOADS_PER_DAY foto per hari
+ * (dihitung per hari WIB / UTC+7, reset jam 00:00 WIB, BUKAN jam 00:00 UTC
+ * dan BUKAN rolling 24 jam dari upload pertama). Ini dihitung dari upload
+ * yang LOLOS captcha & validasi file dasar -- terlepas dari hasil
+ * auto-moderasi (approved/rejected/pending tetap makan jatah), karena tiap
+ * percobaan upload tetap makan resource (Workers AI call + R2 storage).
+ *
+ * Catatan soal WIB: Worker jalan di server yang jamnya UTC, jadi buat dapetin
+ * "hari ini menurut WIB" kita geser waktu +7 jam dulu sebelum diambil bagian
+ * tanggalnya (fungsi `wibDateStr`). Ini cukup akurat buat kebutuhan rate
+ * limit harian dan nggak butuh library timezone tambahan.
+ *
+ * Implementasi pakai counter simpel di PHOTOS_KV dengan key
+ * `ratelimit:{ip}:{YYYY-MM-DD}` dan `expirationTtl` 2 hari (biar otomatis
+ * kebersihan sendiri, nggak numpuk selamanya di KV).
+ *
+ * CATATAN JUJUR: pola read-modify-write ke KV di sini TIDAK atomic. Kalau ada
+ * 2 request upload dari IP yang sama yang nyaris bersamaan banget (race
+ * condition dalam hitungan milidetik), secara teori bisa lolos jadi 3x bukan
+ * 2x. Untuk rate-limit anti-spam kasual ini cukup memadai; kalau butuh
+ * presisi absolut (mis. buat billing), baru worth it pakai Durable Object
+ * sebagai counter atomic.
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -59,6 +83,7 @@ const ALLOWED_TYPES = {
 };
 const PAGE_SIZE_DEFAULT = 24;
 const MODERATION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
+const MAX_UPLOADS_PER_DAY = 2; // batas upload per IP per hari (UTC)
 const MODERATION_QUESTION =
   "Look at this image carefully. This gallery accepts digital/AI-generated art, including " +
   "fantasy, surreal, and ethereal styles that often feature stylized humanoid figures, " +
@@ -125,6 +150,37 @@ function bytesToBase64(bytes) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
+}
+
+// Ambil string tanggal "hari ini" menurut WIB (UTC+7), format YYYY-MM-DD.
+// Worker jalan dengan jam sistem UTC, jadi kita geser +7 jam dulu sebelum
+// ambil bagian tanggalnya lewat toISOString().
+const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
+function wibDateStr(date = new Date()) {
+  return new Date(date.getTime() + WIB_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+// ---- Rate limit upload per IP: maks MAX_UPLOADS_PER_DAY per hari (WIB) ----
+// Return: { allowed: boolean, count: number, remaining: number }
+async function checkAndIncrementUploadRateLimit(env, ip) {
+  // Kalau karena suatu sebab IP nggak kebaca (jarang terjadi di Cloudflare,
+  // tapi jaga-jaga), jangan diam-diam meloloskan tanpa batas -- treat semua
+  // request tanpa IP sebagai satu grup 'unknown' yang tetap dibatasi.
+  const key = `ratelimit:${ip || 'unknown'}:${wibDateStr()}`;
+
+  const raw = await env.PHOTOS_KV.get(key);
+  const count = raw ? (parseInt(raw, 10) || 0) : 0;
+
+  if (count >= MAX_UPLOADS_PER_DAY) {
+    return { allowed: false, count, remaining: 0 };
+  }
+
+  const newCount = count + 1;
+  // TTL 2 hari: cukup buat nutupin hari berjalan + buffer, sekalian bikin
+  // KV otomatis beres-beres sendiri (nggak numpuk key lama selamanya).
+  await env.PHOTOS_KV.put(key, String(newCount), { expirationTtl: 60 * 60 * 24 * 2 });
+
+  return { allowed: true, count: newCount, remaining: MAX_UPLOADS_PER_DAY - newCount };
 }
 
 // ---- Verifikasi Google reCAPTCHA v2 ----
@@ -275,6 +331,19 @@ export default {
           return json({ ok: false, error: 'Format harus JPG, PNG, WEBP, atau GIF.' }, 400, cors);
         }
 
+        // ---- Rate limit per IP: maks MAX_UPLOADS_PER_DAY foto per hari ----
+        // Ditaruh SETELAH validasi dasar (biar error "format salah" dll tetap
+        // muncul duluan), tapi SEBELUM moderasi AI & simpan ke R2 (biar kalau
+        // kena limit, kita nggak buang-buang panggilan Workers AI / storage).
+        const rateLimit = await checkAndIncrementUploadRateLimit(env, remoteIp);
+        if (!rateLimit.allowed) {
+          return json(
+            { ok: false, error: `Batas upload harian tercapai (maksimal ${MAX_UPLOADS_PER_DAY} foto per hari). Coba lagi besok ya.` },
+            429,
+            cors
+          );
+        }
+
         const id = newId();
         const filename = `${id}.${ext}`;
         const bytes = new Uint8Array(await file.arrayBuffer());
@@ -313,7 +382,7 @@ export default {
         targetIndex.unshift(record);
         await setIndex(env, moderation.status, targetIndex);
 
-        return json({ ok: true, status: moderation.status }, 200, cors);
+        return json({ ok: true, status: moderation.status, uploads_remaining_today: rateLimit.remaining }, 200, cors);
       }
 
       // ---- Public: serve an image from R2 ----
