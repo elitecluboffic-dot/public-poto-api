@@ -167,27 +167,17 @@ async function moderateImage(env, bytes, mimeType) {
       temperature: 0,
     });
 
-    const answer = (result && result.answer ? String(result.answer) : '').trim().toUpperCase();
+    // PENTING: struktur respons Workers AI buat model ini ternyata NESTED --
+    // jawabannya ada di result.result.answer, bukan result.answer langsung.
+    // Bentuk lengkapnya: { result: { answer, caption, finish_reason, ... }, usage: {...} }
+    const inner = (result && result.result) ? result.result : result;
+    const answer = (inner && inner.answer ? String(inner.answer) : '').trim().toUpperCase();
 
     // Kalau jawabannya kosong DAN generation-nya kepotong karena kehabisan token,
     // catat itu spesifik di reason -- bukan cuma "ambiguous" -- biar ke-diagnosa
     // lebih cepat kalau ini kejadian lagi.
-    if (!answer && result && result.finish_reason === 'length') {
+    if (!answer && inner && inner.finish_reason === 'length') {
       return { status: 'pending', reason: 'ai-truncated-max-tokens-too-low' };
-    }
-
-    // DEBUG SEMENTARA: kalau jawaban kosong/ambigu, simpen mentahan hasil
-    // dari AI ke reason (dipotong biar nggak kepanjangan) -- ini buat
-    // ketahuan persis struktur JSON yang beneran dibalikin modelnya,
-    // soalnya field 'answer' ternyata nggak selalu keisi sesuai dugaan.
-    if (!answer || (!answer.includes('SAFE') && !answer.includes('UNSAFE'))) {
-      let raw;
-      try {
-        raw = JSON.stringify(result);
-      } catch (e) {
-        raw = String(result);
-      }
-      return { status: 'pending', reason: 'ai-debug-raw:' + (raw || '').slice(0, 400) };
     }
 
     if (answer.includes('UNSAFE')) {
