@@ -73,18 +73,26 @@
  * presisi absolut (mis. buat billing), baru worth it pakai Durable Object
  * sebagai counter atomic.
  *
- * ---- Validasi tipe file "asli" (magic bytes) [BARU] ----
+ * ---- Validasi tipe file "asli" (magic bytes) ----
  * `file.type` yang dikirim browser gampang dipalsuin (orang bisa ubah header
  * request biar ngaku file-nya "image/png" padahal isinya bukan). Sebelum file
  * disimpan ke R2, kita cek beberapa byte pertama file itu sendiri buat mastiin
  * isinya BENERAN gambar sesuai tipe yang diklaim. Kalau nggak cocok, upload
  * ditolak sebelum sempat disimpan.
  *
- * ---- Perbandingan ADMIN_TOKEN pakai constant-time compare [BARU] ----
+ * ---- Perbandingan ADMIN_TOKEN pakai constant-time compare ----
  * `===` biasa buat bandingin string berhenti di karakter pertama yang beda,
  * jadi secara teori waktu eksekusinya bisa dipakai buat nebak token karakter
  * demi karakter (timing attack). Diganti pakai perbandingan yang selalu
  * mengecek semua karakter meski udah ketemu beda dari karakter awal.
+ *
+ * ---- Lockout percobaan admin per IP [BARU] ----
+ * Sebelumnya endpoint /api/admin/* bisa dicoba tebak-tebak ADMIN_TOKEN tanpa
+ * batas -- nggak ada penalti apapun buat percobaan gagal berulang. Sekarang,
+ * tiap IP yang gagal masukin token yang benar sebanyak MAX_ADMIN_ATTEMPTS
+ * dalam window ADMIN_LOCKOUT_WINDOW_SECONDS bakal diblokir sementara (HTTP
+ * 429) sampai window itu habis. Counter di-reset otomatis begitu IP itu
+ * berhasil masukin token yang benar.
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -97,6 +105,8 @@ const ALLOWED_TYPES = {
 const PAGE_SIZE_DEFAULT = 24;
 const MODERATION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const MAX_UPLOADS_PER_DAY = 2; // batas upload per IP per hari (WIB)
+const MAX_ADMIN_ATTEMPTS = 5; // maks percobaan token admin gagal per window
+const ADMIN_LOCKOUT_WINDOW_SECONDS = 15 * 60; // 15 menit
 const MODERATION_QUESTION =
   "Look at this image carefully. This gallery accepts digital/AI-generated art, including " +
   "fantasy, surreal, and ethereal styles that often feature stylized humanoid figures, " +
@@ -151,6 +161,26 @@ function requireAdmin(request, env) {
   const token = request.headers.get('X-Admin-Token') || '';
   if (!token || !env.ADMIN_TOKEN) return false;
   return timingSafeEqual(token, env.ADMIN_TOKEN);
+}
+
+// ---- Lockout percobaan admin per IP ----
+// Return: { blocked: boolean, count: number }
+async function checkAdminAttemptLimit(env, ip) {
+  const key = `admin_fail:${ip || 'unknown'}`;
+  const raw = await env.PHOTOS_KV.get(key);
+  const count = raw ? (parseInt(raw, 10) || 0) : 0;
+  return { blocked: count >= MAX_ADMIN_ATTEMPTS, count };
+}
+
+async function recordFailedAdminAttempt(env, ip) {
+  const key = `admin_fail:${ip || 'unknown'}`;
+  const raw = await env.PHOTOS_KV.get(key);
+  const count = raw ? (parseInt(raw, 10) || 0) : 0;
+  await env.PHOTOS_KV.put(key, String(count + 1), { expirationTtl: ADMIN_LOCKOUT_WINDOW_SECONDS });
+}
+
+async function clearAdminAttempts(env, ip) {
+  await env.PHOTOS_KV.delete(`admin_fail:${ip || 'unknown'}`);
 }
 
 async function getIndex(env, status) {
@@ -474,9 +504,25 @@ export default {
 
       // ---- Admin routes below require X-Admin-Token ----
       if (path.startsWith('/api/admin/')) {
+        const remoteIp = request.headers.get('CF-Connecting-IP') || '';
+
+        // Cek dulu apakah IP ini lagi di-lockout karena kebanyakan gagal
+        const attemptStatus = await checkAdminAttemptLimit(env, remoteIp);
+        if (attemptStatus.blocked) {
+          return json(
+            { ok: false, error: 'Terlalu banyak percobaan gagal. Coba lagi dalam beberapa menit.' },
+            429,
+            cors
+          );
+        }
+
         if (!requireAdmin(request, env)) {
+          await recordFailedAdminAttempt(env, remoteIp);
           return json({ ok: false, error: 'Unauthorized' }, 401, cors);
         }
+
+        // Token benar -> reset counter gagal biar nggak numpuk dari percobaan lama
+        await clearAdminAttempts(env, remoteIp);
 
         // list by status
         if (path === '/api/admin/photos' && request.method === 'GET') {
