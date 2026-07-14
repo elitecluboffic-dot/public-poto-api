@@ -2,97 +2,48 @@
  * Public Poto — Cloudflare Worker backend
  *
  * Bindings dibutuhkan (set di wrangler.toml / dashboard):
- *  - PHOTOS_KV           : KV namespace (metadata + index + rate limit counter)
+ *  - PHOTOS_KV           : KV namespace (metadata + index + rate limit counter + premium codes)
  *  - PHOTOS_BUCKET       : R2 bucket (file gambar)
  *  - AI                    : Workers AI binding (wajib buat auto-moderasi)
  *  - ADMIN_TOKEN          : secret string (buat proteksi endpoint admin)
  *  - ALLOWED_ORIGIN       : origin frontend kamu, mis. "https://situskamu.com"
  *  - RECAPTCHA_SECRET_KEY : secret string dari Google reCAPTCHA v2
- *  - AUTO_MODERATION       : "on" / "off" (var biasa, bukan secret). Kalau "off"
- *                            atau nggak di-set, semua upload tetap masuk "pending"
- *                            seperti sebelumnya (perilaku lama, aman sebagai default).
+ *  - AUTO_MODERATION       : "on" / "off"
  *
- * Cara nambahin binding AI (Workers AI) di wrangler.toml:
- *   [ai]
- *   binding = "AI"
+ * ---- FITUR BARU: Premium via Kode Redeem ----
+ * User bisa beli premium (di luar sistem ini, lewat WhatsApp) lalu admin
+ * generate kode unik dari panel admin dengan durasi tertentu (hari). User
+ * masukin kode itu di halaman publik lewat endpoint POST /api/redeem.
+ * Begitu kode valid & belum dipakai, IP yang redeem kode itu langsung
+ * ditandai "premium aktif" sampai tanggal tertentu (expires_at), dan
+ * SELAMA premium aktif, IP itu DIBEBASKAN dari rate limit upload harian
+ * (MAX_UPLOADS_PER_DAY diabaikan sepenuhnya).
  *
- * Cara nambahin secret RECAPTCHA_SECRET_KEY:
- *   wrangler secret put RECAPTCHA_SECRET_KEY
+ * Data disimpan di KV:
+ *  - `premcode:{CODE}`   : { code, duration_days, created_at, revoked, used, used_at, used_ip }
+ *  - `premcodes_index`   : array of code string (buat listing di admin panel)
+ *  - `premium:{ip}`      : { code, activated_at, expires_at } dengan expirationTtl
+ *                          sesuai duration_days, jadi otomatis "hangus" sendiri
+ *                          di KV pas masa aktifnya abis.
  *
- * Cara nyalain auto-moderasi:
- *   wrangler.toml -> [vars] -> AUTO_MODERATION = "on"
- *   (atau di dashboard: Worker -> Settings -> Variables -> Text)
+ * Catatan: sistem ini nge-tag premium ke IP address (bukan akun/login),
+ * karena situs ini emang nggak punya sistem akun user. Konsekuensinya:
+ * kalau IP publik user berubah (ganti wifi, ganti jaringan seluler, dll),
+ * status premium-nya nggak keliatan lagi dari IP baru itu sampai dia
+ * redeem ulang kodenya sendiri kalau belum "used". TAPI kode dibuat
+ * SEKALI PAKAI (`used: true` setelah redeem pertama), jadi kalau IP
+ * berubah, user PERLU kode baru dari admin -- ini limitasi yang harus
+ * disadari dari desain "tanpa akun" ini.
  *
- * PENTING: pakai secret key YANG BARU (di-regenerate), bukan yang lama yang
- * pernah kelihatan di screenshot config.php. Anggap yang lama itu bocor.
- *
- * ---- Cara kerja auto-moderasi ----
- * Setiap upload yang lolos captcha & validasi dasar (tipe file, ukuran) akan
- * dikirim ke model vision Moondream 3.1 (@cf/moondream/moondream3.1-9B-A2B) di
- * Workers AI dengan pertanyaan: apakah gambar ini aman buat galeri foto publik
- * yang family-friendly, plus minta alasan singkat (di bawah 15 kata).
- *   - Kalau model jawab "VERDICT: SAFE"   -> foto langsung masuk status "approved"
- *   - Kalau model jawab "VERDICT: UNSAFE" -> foto langsung masuk status "rejected"
- *   - Kalau model error / jawaban ambigu  -> foto FALLBACK ke "pending" (fail-safe,
- *     supaya kalau AI-nya lagi bermasalah, konten nggak lolos begitu aja tanpa
- *     ada yang cek)
- * Alasan singkat dari model disimpan di field `moderation_reason` tiap record,
- * jadi admin bisa lihat KENAPA suatu foto ditolak/disetujui, bukan cuma label.
- *
- * File foto SELALU disimpan ke R2, termasuk yang berstatus "rejected" -- ini
- * supaya admin bisa buka & lihat gambarnya sendiri buat verifikasi manual kalau
- * curiga AI-nya salah tebak (false positive). Foto berstatus "rejected" TIDAK
- * PERNAH otomatis tampil ke publik (endpoint /api/photos cuma nampilin yang
- * "approved"), jadi ini aman dari sisi publik. Kalau nanti storage jadi
- * perhatian, admin bisa hapus manual foto "rejected" yang numpuk lewat tombol
- * Hapus di panel admin.
- * Admin tetap bisa override manual kapan aja lewat endpoint /api/admin/photos/:id/:action,
- * apa pun status hasil auto-moderasinya.
- *
- * ---- Rate limit upload per IP ----
- * Setiap IP cuma boleh upload maksimal MAX_UPLOADS_PER_DAY foto per hari
- * (dihitung per hari WIB / UTC+7, reset jam 00:00 WIB, BUKAN jam 00:00 UTC
- * dan BUKAN rolling 24 jam dari upload pertama). Ini dihitung dari upload
- * yang LOLOS captcha & validasi file dasar -- terlepas dari hasil
- * auto-moderasi (approved/rejected/pending tetap makan jatah), karena tiap
- * percobaan upload tetap makan resource (Workers AI call + R2 storage).
- *
- * Catatan soal WIB: Worker jalan di server yang jamnya UTC, jadi buat dapetin
- * "hari ini menurut WIB" kita geser waktu +7 jam dulu sebelum diambil bagian
- * tanggalnya (fungsi `wibDateStr`). Ini cukup akurat buat kebutuhan rate
- * limit harian dan nggak butuh library timezone tambahan.
- *
- * Implementasi pakai counter simpel di PHOTOS_KV dengan key
- * `ratelimit:{ip}:{YYYY-MM-DD}` dan `expirationTtl` 2 hari (biar otomatis
- * kebersihan sendiri, nggak numpuk selamanya di KV).
- *
- * CATATAN JUJUR: pola read-modify-write ke KV di sini TIDAK atomic. Kalau ada
- * 2 request upload dari IP yang sama yang nyaris bersamaan banget (race
- * condition dalam hitungan milidetik), secara teori bisa lolos jadi 3x bukan
- * 2x. Untuk rate-limit anti-spam kasual ini cukup memadai; kalau butuh
- * presisi absolut (mis. buat billing), baru worth it pakai Durable Object
- * sebagai counter atomic.
- *
- * ---- Validasi tipe file "asli" (magic bytes) ----
- * `file.type` yang dikirim browser gampang dipalsuin (orang bisa ubah header
- * request biar ngaku file-nya "image/png" padahal isinya bukan). Sebelum file
- * disimpan ke R2, kita cek beberapa byte pertama file itu sendiri buat mastiin
- * isinya BENERAN gambar sesuai tipe yang diklaim. Kalau nggak cocok, upload
- * ditolak sebelum sempat disimpan.
- *
- * ---- Perbandingan ADMIN_TOKEN pakai constant-time compare ----
- * `===` biasa buat bandingin string berhenti di karakter pertama yang beda,
- * jadi secara teori waktu eksekusinya bisa dipakai buat nebak token karakter
- * demi karakter (timing attack). Diganti pakai perbandingan yang selalu
- * mengecek semua karakter meski udah ketemu beda dari karakter awal.
- *
- * ---- Lockout percobaan admin per IP [BARU] ----
- * Sebelumnya endpoint /api/admin/* bisa dicoba tebak-tebak ADMIN_TOKEN tanpa
- * batas -- nggak ada penalti apapun buat percobaan gagal berulang. Sekarang,
- * tiap IP yang gagal masukin token yang benar sebanyak MAX_ADMIN_ATTEMPTS
- * dalam window ADMIN_LOCKOUT_WINDOW_SECONDS bakal diblokir sementara (HTTP
- * 429) sampai window itu habis. Counter di-reset otomatis begitu IP itu
- * berhasil masukin token yang benar.
+ * ---- Endpoint baru ----
+ * Publik:
+ *   POST /api/redeem            { code }             -> aktifkan premium utk IP pemanggil
+ *   GET  /api/premium/status                          -> cek premium aktif utk IP pemanggil
+ * Admin (butuh X-Admin-Token, sama seperti endpoint admin lain):
+ *   POST /api/admin/codes/generate   { duration_days } -> generate kode baru
+ *   GET  /api/admin/codes                              -> list semua kode + statusnya
+ *   POST /api/admin/codes/:code/revoke                 -> nonaktifkan kode yang belum dipakai
+ *   POST /api/admin/codes/:code/delete                 -> hapus kode dari histori
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -104,9 +55,9 @@ const ALLOWED_TYPES = {
 };
 const PAGE_SIZE_DEFAULT = 24;
 const MODERATION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
-const MAX_UPLOADS_PER_DAY = 2; // batas upload per IP per hari (WIB)
-const MAX_ADMIN_ATTEMPTS = 5; // maks percobaan token admin gagal per window
-const ADMIN_LOCKOUT_WINDOW_SECONDS = 15 * 60; // 15 menit
+const MAX_UPLOADS_PER_DAY = 2; // batas upload per IP per hari (WIB) -- diabaikan kalau premium aktif
+const MAX_ADMIN_ATTEMPTS = 5;
+const ADMIN_LOCKOUT_WINDOW_SECONDS = 15 * 60;
 const MODERATION_QUESTION =
   "Look at this image carefully. This gallery accepts digital/AI-generated art, including " +
   "fantasy, surreal, and ethereal styles that often feature stylized humanoid figures, " +
@@ -125,9 +76,6 @@ const MODERATION_QUESTION =
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
   const allowed = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
-  // Kalau ALLOWED_ORIGIN belum di-set sama sekali, jangan fallback ke "*"
-  // (itu ngizinin semua origin akses API). Fallback ke "null" yang efeknya
-  // browser tetap nolak cross-origin request.
   const allowOrigin = allowed.includes(origin) ? origin : (allowed[0] || 'null');
   return {
     'Access-Control-Allow-Origin': allowOrigin,
@@ -144,9 +92,6 @@ function json(data, status, extraHeaders) {
   });
 }
 
-// Constant-time string compare -- selalu ngecek semua karakter, nggak
-// berhenti di awal begitu ketemu beda, biar waktu eksekusinya nggak bocorin
-// informasi soal seberapa jauh tebakan token itu benar.
 function timingSafeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length !== b.length) return false;
@@ -163,8 +108,6 @@ function requireAdmin(request, env) {
   return timingSafeEqual(token, env.ADMIN_TOKEN);
 }
 
-// ---- Lockout percobaan admin per IP ----
-// Return: { blocked: boolean, count: number }
 async function checkAdminAttemptLimit(env, ip) {
   const key = `admin_fail:${ip || 'unknown'}`;
   const raw = await env.PHOTOS_KV.get(key);
@@ -202,8 +145,6 @@ function newId() {
 }
 
 function bytesToBase64(bytes) {
-  // Convert dalam chunk biar nggak kena limit argumen String.fromCharCode
-  // buat file gambar yang cukup besar (sampai 5MB).
   let binary = '';
   const chunkSize = 0x8000;
   for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -212,51 +153,29 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-// ---- Deteksi tipe file "asli" dari isi byte-nya, bukan dari klaim browser ----
-// Ngecek "magic bytes" -- beberapa byte pertama tiap format gambar yang khas
-// dan konsisten -- biar file yang dipalsuin Content-Type-nya ketahuan.
-// Return: mime type asli kalau dikenali, atau null kalau nggak cocok format apapun.
 function detectRealImageType(bytes) {
   if (bytes.length < 12) return null;
-
-  // JPEG: dimulai dengan FF D8
   if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
-
-  // PNG: dimulai dengan 89 50 4E 47 (‰PNG)
   if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) {
     return 'image/png';
   }
-
-  // GIF: dimulai dengan "GIF87a" atau "GIF89a"
   if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
-
-  // WEBP: "RIFF"....'WEBP' -- 4 byte pertama RIFF, byte 8-11 WEBP
   if (
     bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
     bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
   ) {
     return 'image/webp';
   }
-
   return null;
 }
 
-// Ambil string tanggal "hari ini" menurut WIB (UTC+7), format YYYY-MM-DD.
-// Worker jalan dengan jam sistem UTC, jadi kita geser +7 jam dulu sebelum
-// ambil bagian tanggalnya lewat toISOString().
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 function wibDateStr(date = new Date()) {
   return new Date(date.getTime() + WIB_OFFSET_MS).toISOString().slice(0, 10);
 }
 
-// ---- Rate limit upload per IP: maks MAX_UPLOADS_PER_DAY per hari (WIB) ----
-// Return: { allowed: boolean, count: number, remaining: number }
 async function checkAndIncrementUploadRateLimit(env, ip) {
-  // Kalau karena suatu sebab IP nggak kebaca (jarang terjadi di Cloudflare,
-  // tapi jaga-jaga), jangan diam-diam meloloskan tanpa batas -- treat semua
-  // request tanpa IP sebagai satu grup 'unknown' yang tetap dibatasi.
   const key = `ratelimit:${ip || 'unknown'}:${wibDateStr()}`;
-
   const raw = await env.PHOTOS_KV.get(key);
   const count = raw ? (parseInt(raw, 10) || 0) : 0;
 
@@ -265,18 +184,107 @@ async function checkAndIncrementUploadRateLimit(env, ip) {
   }
 
   const newCount = count + 1;
-  // TTL 2 hari: cukup buat nutupin hari berjalan + buffer, sekalian bikin
-  // KV otomatis beres-beres sendiri (nggak numpuk key lama selamanya).
   await env.PHOTOS_KV.put(key, String(newCount), { expirationTtl: 60 * 60 * 24 * 2 });
 
   return { allowed: true, count: newCount, remaining: MAX_UPLOADS_PER_DAY - newCount };
 }
 
+// ==================================================================
+// ==== PREMIUM: kode redeem & status aktif per IP =====
+// ==================================================================
+
+// Generate kode acak format XXXX-XXXX-XXXX, pakai charset yang buang
+// karakter ambigu (0/O, 1/I/L) biar gampang diketik ulang user.
+function generatePremiumCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  function group() {
+    let s = '';
+    for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    return s;
+  }
+  return `${group()}-${group()}-${group()}`;
+}
+
+// Cek status premium aktif buat suatu IP.
+// Return: { active: boolean, expires_at?: string, code?: string }
+async function checkPremiumStatus(env, ip) {
+  if (!ip) return { active: false };
+  const raw = await env.PHOTOS_KV.get(`premium:${ip}`);
+  if (!raw) return { active: false };
+  try {
+    const data = JSON.parse(raw);
+    if (data.expires_at && new Date(data.expires_at).getTime() > Date.now()) {
+      return { active: true, expires_at: data.expires_at, code: data.code };
+    }
+    return { active: false };
+  } catch (e) {
+    return { active: false };
+  }
+}
+
+async function getPremCodesIndex(env) {
+  const raw = await env.PHOTOS_KV.get('premcodes_index');
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function setPremCodesIndex(env, arr) {
+  await env.PHOTOS_KV.put('premcodes_index', JSON.stringify(arr));
+}
+
+// ---- Auto-moderasi pakai Workers AI (Moondream 3.1) ----
+async function moderateImage(env, bytes, mimeType) {
+  if ((env.AUTO_MODERATION || '').toLowerCase() !== 'on') {
+    return { status: 'pending', reason: 'auto-moderation-disabled' };
+  }
+  if (!env.AI) {
+    return { status: 'pending', reason: 'ai-binding-missing' };
+  }
+
+  try {
+    const base64 = bytesToBase64(bytes);
+    const dataUri = `data:${mimeType};base64,${base64}`;
+
+    const result = await env.AI.run(MODERATION_MODEL, {
+      task: 'query',
+      image: dataUri,
+      question: MODERATION_QUESTION,
+      reasoning: false,
+      max_tokens: 64,
+      stream: false,
+      temperature: 0,
+    });
+
+    const inner = (result && result.result) ? result.result : result;
+    const rawAnswer = (inner && inner.answer ? String(inner.answer) : '').trim();
+    const answer = rawAnswer.toUpperCase();
+
+    if (!answer && inner && inner.finish_reason === 'length') {
+      return { status: 'pending', reason: 'ai-truncated-max-tokens-too-low' };
+    }
+
+    function extractReasonText(text) {
+      const dashIdx = text.indexOf('-');
+      const reasonPart = dashIdx !== -1 ? text.slice(dashIdx + 1) : text;
+      return reasonPart.trim().replace(/\s+/g, ' ').slice(0, 150);
+    }
+
+    if (answer.includes('UNSAFE')) {
+      const why = extractReasonText(rawAnswer) || 'tidak ada alasan spesifik dari AI';
+      return { status: 'rejected', reason: `ai-flagged-unsafe: ${why}` };
+    }
+    if (answer.includes('SAFE')) {
+      const why = extractReasonText(rawAnswer) || 'tidak ada alasan spesifik dari AI';
+      return { status: 'approved', reason: `ai-flagged-safe: ${why}` };
+    }
+    return { status: 'pending', reason: `ai-ambiguous-answer:${answer.slice(0, 80)}` };
+  } catch (err) {
+    return { status: 'pending', reason: 'ai-error:' + err.message };
+  }
+}
+
 // ---- Verifikasi Google reCAPTCHA v2 ----
 async function verifyRecaptcha(token, env, remoteIp) {
   if (!env.RECAPTCHA_SECRET_KEY) {
-    // Kalau secret belum di-set di Worker, jangan diam-diam meloloskan request.
-    // Ini bikin error jelas ketimbang "captcha ternyata nggak pernah dicek".
     return { success: false, error: 'server-misconfigured' };
   }
   if (!token || typeof token !== 'string') {
@@ -295,77 +303,9 @@ async function verifyRecaptcha(token, env, remoteIp) {
       body: params.toString(),
     });
     const data = await res.json();
-    return data; // { success: bool, 'error-codes': [...] , ... }
+    return data;
   } catch (err) {
     return { success: false, error: 'verify-request-failed' };
-  }
-}
-
-// ---- Auto-moderasi pakai Workers AI (Moondream 3.1) ----
-// Return: { status: 'approved' | 'rejected' | 'pending', reason: string }
-// 'pending' dipakai sebagai fallback aman kalau AI error / jawaban nggak jelas,
-// atau kalau AUTO_MODERATION lagi dimatikan.
-async function moderateImage(env, bytes, mimeType) {
-  if ((env.AUTO_MODERATION || '').toLowerCase() !== 'on') {
-    return { status: 'pending', reason: 'auto-moderation-disabled' };
-  }
-  if (!env.AI) {
-    return { status: 'pending', reason: 'ai-binding-missing' };
-  }
-
-  try {
-    const base64 = bytesToBase64(bytes);
-    const dataUri = `data:${mimeType};base64,${base64}`;
-
-    const result = await env.AI.run(MODERATION_MODEL, {
-      task: 'query',
-      image: dataUri,
-      question: MODERATION_QUESTION,
-      reasoning: false, // matikan reasoning trace, kita cuma butuh jawaban akhir
-      max_tokens: 64,    // PENTING: jangan diset terlalu kecil (mis. 16) -- itu bikin
-                          // jawaban kepotong sebelum sempat nulis SAFE/UNSAFE sama
-                          // sekali, hasilnya field `answer` balik kosong. Default
-                          // resmi model ini 8192; 64 udah lebih dari cukup buat
-                          // satu kata jawaban + sedikit toleransi.
-      stream: false,     // default true di API-nya, kita matikan biar respons langsung utuh
-      temperature: 0,
-    });
-
-    // PENTING: struktur respons Workers AI buat model ini ternyata NESTED --
-    // jawabannya ada di result.result.answer, bukan result.answer langsung.
-    // Bentuk lengkapnya: { result: { answer, caption, finish_reason, ... }, usage: {...} }
-    const inner = (result && result.result) ? result.result : result;
-    const rawAnswer = (inner && inner.answer ? String(inner.answer) : '').trim();
-    const answer = rawAnswer.toUpperCase();
-
-    // Kalau jawabannya kosong DAN generation-nya kepotong karena kehabisan token,
-    // catat itu spesifik di reason -- bukan cuma "ambiguous" -- biar ke-diagnosa
-    // lebih cepat kalau ini kejadian lagi.
-    if (!answer && inner && inner.finish_reason === 'length') {
-      return { status: 'pending', reason: 'ai-truncated-max-tokens-too-low' };
-    }
-
-    // Ambil bagian alasan singkat yang ditulis model setelah "VERDICT: SAFE/UNSAFE"
-    // (biasanya dipisah tanda "-"), biar bisa ditampilin ke admin -- bukan cuma
-    // label "unsafe" doang tanpa konteks kenapa.
-    function extractReasonText(text) {
-      const dashIdx = text.indexOf('-');
-      const reasonPart = dashIdx !== -1 ? text.slice(dashIdx + 1) : text;
-      return reasonPart.trim().replace(/\s+/g, ' ').slice(0, 150);
-    }
-
-    if (answer.includes('UNSAFE')) {
-      const why = extractReasonText(rawAnswer) || 'tidak ada alasan spesifik dari AI';
-      return { status: 'rejected', reason: `ai-flagged-unsafe: ${why}` };
-    }
-    if (answer.includes('SAFE')) {
-      const why = extractReasonText(rawAnswer) || 'tidak ada alasan spesifik dari AI';
-      return { status: 'approved', reason: `ai-flagged-safe: ${why}` };
-    }
-    // Jawaban ambigu -> jangan asal loloskan, kirim ke antrian manual.
-    return { status: 'pending', reason: `ai-ambiguous-answer:${answer.slice(0, 80)}` };
-  } catch (err) {
-    return { status: 'pending', reason: 'ai-error:' + err.message };
   }
 }
 
@@ -389,6 +329,56 @@ export default {
         return json({ photos: page, total: index.length }, 200, cors);
       }
 
+      // ---- Public: cek status premium IP pemanggil ----
+      if (path === '/api/premium/status' && request.method === 'GET') {
+        const remoteIp = request.headers.get('CF-Connecting-IP') || '';
+        const status = await checkPremiumStatus(env, remoteIp);
+        return json({ ok: true, premium: status.active, expires_at: status.expires_at || null }, 200, cors);
+      }
+
+      // ---- Public: redeem kode premium ----
+      if (path === '/api/redeem' && request.method === 'POST') {
+        const remoteIp = request.headers.get('CF-Connecting-IP') || '';
+
+        let body;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return json({ ok: false, error: 'Data tidak valid.' }, 400, cors);
+        }
+
+        const code = (body && body.code ? String(body.code) : '').trim().toUpperCase();
+        if (!code) return json({ ok: false, error: 'Kode wajib diisi.' }, 400, cors);
+
+        const raw = await env.PHOTOS_KV.get(`premcode:${code}`);
+        if (!raw) return json({ ok: false, error: 'Kode tidak ditemukan atau tidak valid.' }, 404, cors);
+
+        const data = JSON.parse(raw);
+        if (data.revoked) {
+          return json({ ok: false, error: 'Kode ini sudah dinonaktifkan.' }, 400, cors);
+        }
+        if (data.used) {
+          return json({ ok: false, error: 'Kode ini sudah pernah dipakai.' }, 400, cors);
+        }
+
+        const now = new Date();
+        const durationDays = data.duration_days || 30;
+        const expiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+
+        data.used = true;
+        data.used_at = now.toISOString();
+        data.used_ip = remoteIp;
+        await env.PHOTOS_KV.put(`premcode:${code}`, JSON.stringify(data));
+
+        await env.PHOTOS_KV.put(
+          `premium:${remoteIp}`,
+          JSON.stringify({ code, activated_at: now.toISOString(), expires_at: expiresAt }),
+          { expirationTtl: durationDays * 24 * 60 * 60 }
+        );
+
+        return json({ ok: true, expires_at: expiresAt, duration_days: durationDays }, 200, cors);
+      }
+
       // ---- Public: upload a new photo (auto-approve / auto-reject / pending) ----
       if (path === '/api/upload' && request.method === 'POST') {
         const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
@@ -402,7 +392,6 @@ export default {
         const uploaderName = (form.get('uploader_name') || '').toString().slice(0, 100).trim();
         const captchaToken = (form.get('g-recaptcha-response') || '').toString();
 
-        // ---- Verifikasi captcha DULU, sebelum sentuh file / R2 / KV ----
         const remoteIp = request.headers.get('CF-Connecting-IP') || '';
         const captchaResult = await verifyRecaptcha(captchaToken, env, remoteIp);
         if (!captchaResult.success) {
@@ -420,25 +409,27 @@ export default {
           return json({ ok: false, error: 'Format harus JPG, PNG, WEBP, atau GIF.' }, 400, cors);
         }
 
-        // ---- Rate limit per IP: maks MAX_UPLOADS_PER_DAY foto per hari ----
-        // Ditaruh SETELAH validasi dasar (biar error "format salah" dll tetap
-        // muncul duluan), tapi SEBELUM moderasi AI & simpan ke R2 (biar kalau
-        // kena limit, kita nggak buang-buang panggilan Workers AI / storage).
-        const rateLimit = await checkAndIncrementUploadRateLimit(env, remoteIp);
-        if (!rateLimit.allowed) {
-          return json(
-            { ok: false, error: `Batas upload harian tercapai (maksimal ${MAX_UPLOADS_PER_DAY} foto per hari). Coba lagi besok ya.` },
-            429,
-            cors
-          );
+        // ---- Cek premium DULU: kalau aktif, rate limit harian diabaikan ----
+        const premiumStatus = await checkPremiumStatus(env, remoteIp);
+        let rateLimit;
+        if (premiumStatus.active) {
+          rateLimit = { allowed: true, count: 0, remaining: 'unlimited' };
+        } else {
+          rateLimit = await checkAndIncrementUploadRateLimit(env, remoteIp);
+          if (!rateLimit.allowed) {
+            return json(
+              {
+                ok: false,
+                error: `Batas upload harian tercapai (maksimal ${MAX_UPLOADS_PER_DAY} foto per hari). Upgrade ke Premium buat upload tanpa batas, atau coba lagi besok ya.`,
+              },
+              429,
+              cors
+            );
+          }
         }
 
         const bytes = new Uint8Array(await file.arrayBuffer());
 
-        // ---- Validasi isi file yang SEBENARNYA, bukan cuma klaim browser ----
-        // file.type dikirim dari sisi client dan gampang dipalsuin. Kita cek
-        // beberapa byte pertama file itu sendiri buat mastiin isinya beneran
-        // format gambar yang diklaim, sebelum disimpan ke R2.
         const realType = detectRealImageType(bytes);
         if (!realType || realType !== file.type) {
           return json({ ok: false, error: 'Isi file tidak sesuai dengan format yang diklaim.' }, 400, cors);
@@ -447,17 +438,8 @@ export default {
         const id = newId();
         const filename = `${id}.${ext}`;
 
-        // ---- Auto-moderasi AI sebelum foto ditampilin publik ----
         const moderation = await moderateImage(env, bytes, file.type);
 
-        // File TETAP disimpan meskipun ditolak AI -- ini penting biar admin bisa
-        // buka & lihat sendiri gambarnya di tab "Ditolak" buat verifikasi manual
-        // (mengoreksi false positive). Foto yang ditolak TIDAK pernah otomatis
-        // tampil ke publik (endpoint /api/photos cuma nampilin yang "approved"),
-        // jadi menyimpannya sementara di sini aman dari sisi publik.
-        // Catatan: ini nambah pemakaian storage R2 dibanding sebelumnya -- kalau
-        // suatu saat mau balik ke perilaku "jangan simpan yang ditolak", admin
-        // bisa hapus manual foto yang statusnya "rejected" lewat tombol Hapus.
         await env.PHOTOS_BUCKET.put(`photos/${filename}`, bytes, {
           httpMetadata: { contentType: file.type },
         });
@@ -468,7 +450,7 @@ export default {
           filename,
           title: title || null,
           uploader_name: uploaderName || null,
-          status: moderation.status, // 'approved' | 'rejected' | 'pending'
+          status: moderation.status,
           uploaded_at: now,
           approved_at: moderation.status === 'approved' ? now : null,
           ip: remoteIp || null,
@@ -481,7 +463,16 @@ export default {
         targetIndex.unshift(record);
         await setIndex(env, moderation.status, targetIndex);
 
-        return json({ ok: true, status: moderation.status, uploads_remaining_today: rateLimit.remaining }, 200, cors);
+        return json(
+          {
+            ok: true,
+            status: moderation.status,
+            premium: premiumStatus.active,
+            uploads_remaining_today: rateLimit.remaining,
+          },
+          200,
+          cors
+        );
       }
 
       // ---- Public: serve an image from R2 ----
@@ -493,9 +484,6 @@ export default {
           headers: {
             'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
             'Cache-Control': 'public, max-age=31536000, immutable',
-            // Cegah browser lama "nyium" (sniff) isi file jadi beda dari
-            // Content-Type yang di-declare -- pertahanan tambahan di atas
-            // validasi magic bytes pas upload.
             'X-Content-Type-Options': 'nosniff',
             ...cors,
           },
@@ -506,7 +494,6 @@ export default {
       if (path.startsWith('/api/admin/')) {
         const remoteIp = request.headers.get('CF-Connecting-IP') || '';
 
-        // Cek dulu apakah IP ini lagi di-lockout karena kebanyakan gagal
         const attemptStatus = await checkAdminAttemptLimit(env, remoteIp);
         if (attemptStatus.blocked) {
           return json(
@@ -521,7 +508,6 @@ export default {
           return json({ ok: false, error: 'Unauthorized' }, 401, cors);
         }
 
-        // Token benar -> reset counter gagal biar nggak numpuk dari percobaan lama
         await clearAdminAttempts(env, remoteIp);
 
         // list by status
@@ -551,7 +537,6 @@ export default {
           const record = await getPhoto(env, id);
           if (!record) return json({ ok: false, error: 'Foto tidak ditemukan.' }, 404, cors);
 
-          // remove id from whatever index it's currently in
           for (const s of ['pending', 'approved', 'rejected']) {
             const idx = await getIndex(env, s);
             const filtered = idx.filter(p => p.id !== id);
@@ -575,6 +560,76 @@ export default {
           target.unshift(record);
           await setIndex(env, newStatus, target);
 
+          return json({ ok: true }, 200, cors);
+        }
+
+        // ---- PREMIUM: generate kode baru ----
+        if (path === '/api/admin/codes/generate' && request.method === 'POST') {
+          let body;
+          try {
+            body = await request.json();
+          } catch (e) {
+            body = {};
+          }
+          const durationDays = Math.max(1, parseInt(body && body.duration_days, 10) || 30);
+
+          let code = null;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            const candidate = generatePremiumCode();
+            const exists = await env.PHOTOS_KV.get(`premcode:${candidate}`);
+            if (!exists) { code = candidate; break; }
+          }
+          if (!code) return json({ ok: false, error: 'Gagal generate kode unik, coba lagi.' }, 500, cors);
+
+          const record = {
+            code,
+            duration_days: durationDays,
+            created_at: new Date().toISOString(),
+            revoked: false,
+            used: false,
+            used_at: null,
+            used_ip: null,
+          };
+          await env.PHOTOS_KV.put(`premcode:${code}`, JSON.stringify(record));
+
+          const indexArr = await getPremCodesIndex(env);
+          indexArr.unshift(code);
+          await setPremCodesIndex(env, indexArr);
+
+          return json({ ok: true, code: record }, 200, cors);
+        }
+
+        // ---- PREMIUM: list semua kode ----
+        if (path === '/api/admin/codes' && request.method === 'GET') {
+          const indexArr = await getPremCodesIndex(env);
+          const codes = [];
+          for (const c of indexArr) {
+            const raw = await env.PHOTOS_KV.get(`premcode:${c}`);
+            if (raw) codes.push(JSON.parse(raw));
+          }
+          return json({ ok: true, codes }, 200, cors);
+        }
+
+        // ---- PREMIUM: revoke kode yang belum dipakai ----
+        const revokeMatch = path.match(/^\/api\/admin\/codes\/([A-Z0-9-]+)\/revoke$/);
+        if (revokeMatch && request.method === 'POST') {
+          const code = revokeMatch[1];
+          const raw = await env.PHOTOS_KV.get(`premcode:${code}`);
+          if (!raw) return json({ ok: false, error: 'Kode tidak ditemukan.' }, 404, cors);
+          const data = JSON.parse(raw);
+          data.revoked = true;
+          await env.PHOTOS_KV.put(`premcode:${code}`, JSON.stringify(data));
+          return json({ ok: true }, 200, cors);
+        }
+
+        // ---- PREMIUM: hapus kode dari histori ----
+        const deleteCodeMatch = path.match(/^\/api\/admin\/codes\/([A-Z0-9-]+)\/delete$/);
+        if (deleteCodeMatch && request.method === 'POST') {
+          const code = deleteCodeMatch[1];
+          await env.PHOTOS_KV.delete(`premcode:${code}`);
+          const indexArr = await getPremCodesIndex(env);
+          const filtered = indexArr.filter(c => c !== code);
+          await setPremCodesIndex(env, filtered);
           return json({ ok: true }, 200, cors);
         }
       }
