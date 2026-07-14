@@ -49,7 +49,7 @@
  * Admin tetap bisa override manual kapan aja lewat endpoint /api/admin/photos/:id/:action,
  * apa pun status hasil auto-moderasinya.
  *
- * ---- Rate limit upload per IP (BARU) ----
+ * ---- Rate limit upload per IP ----
  * Setiap IP cuma boleh upload maksimal MAX_UPLOADS_PER_DAY foto per hari
  * (dihitung per hari WIB / UTC+7, reset jam 00:00 WIB, BUKAN jam 00:00 UTC
  * dan BUKAN rolling 24 jam dari upload pertama). Ini dihitung dari upload
@@ -72,6 +72,19 @@
  * 2x. Untuk rate-limit anti-spam kasual ini cukup memadai; kalau butuh
  * presisi absolut (mis. buat billing), baru worth it pakai Durable Object
  * sebagai counter atomic.
+ *
+ * ---- Validasi tipe file "asli" (magic bytes) [BARU] ----
+ * `file.type` yang dikirim browser gampang dipalsuin (orang bisa ubah header
+ * request biar ngaku file-nya "image/png" padahal isinya bukan). Sebelum file
+ * disimpan ke R2, kita cek beberapa byte pertama file itu sendiri buat mastiin
+ * isinya BENERAN gambar sesuai tipe yang diklaim. Kalau nggak cocok, upload
+ * ditolak sebelum sempat disimpan.
+ *
+ * ---- Perbandingan ADMIN_TOKEN pakai constant-time compare [BARU] ----
+ * `===` biasa buat bandingin string berhenti di karakter pertama yang beda,
+ * jadi secara teori waktu eksekusinya bisa dipakai buat nebak token karakter
+ * demi karakter (timing attack). Diganti pakai perbandingan yang selalu
+ * mengecek semua karakter meski udah ketemu beda dari karakter awal.
  */
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -83,7 +96,7 @@ const ALLOWED_TYPES = {
 };
 const PAGE_SIZE_DEFAULT = 24;
 const MODERATION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
-const MAX_UPLOADS_PER_DAY = 2; // batas upload per IP per hari (UTC)
+const MAX_UPLOADS_PER_DAY = 2; // batas upload per IP per hari (WIB)
 const MODERATION_QUESTION =
   "Look at this image carefully. This gallery accepts digital/AI-generated art, including " +
   "fantasy, surreal, and ethereal styles that often feature stylized humanoid figures, " +
@@ -101,8 +114,11 @@ const MODERATION_QUESTION =
 
 function corsHeaders(env, request) {
   const origin = request.headers.get('Origin') || '';
-  const allowed = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim());
-  const allowOrigin = allowed.includes(origin) ? origin : allowed[0] || '*';
+  const allowed = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+  // Kalau ALLOWED_ORIGIN belum di-set sama sekali, jangan fallback ke "*"
+  // (itu ngizinin semua origin akses API). Fallback ke "null" yang efeknya
+  // browser tetap nolak cross-origin request.
+  const allowOrigin = allowed.includes(origin) ? origin : (allowed[0] || 'null');
   return {
     'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
@@ -118,9 +134,23 @@ function json(data, status, extraHeaders) {
   });
 }
 
+// Constant-time string compare -- selalu ngecek semua karakter, nggak
+// berhenti di awal begitu ketemu beda, biar waktu eksekusinya nggak bocorin
+// informasi soal seberapa jauh tebakan token itu benar.
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 function requireAdmin(request, env) {
   const token = request.headers.get('X-Admin-Token') || '';
-  return token && env.ADMIN_TOKEN && token === env.ADMIN_TOKEN;
+  if (!token || !env.ADMIN_TOKEN) return false;
+  return timingSafeEqual(token, env.ADMIN_TOKEN);
 }
 
 async function getIndex(env, status) {
@@ -150,6 +180,35 @@ function bytesToBase64(bytes) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
+}
+
+// ---- Deteksi tipe file "asli" dari isi byte-nya, bukan dari klaim browser ----
+// Ngecek "magic bytes" -- beberapa byte pertama tiap format gambar yang khas
+// dan konsisten -- biar file yang dipalsuin Content-Type-nya ketahuan.
+// Return: mime type asli kalau dikenali, atau null kalau nggak cocok format apapun.
+function detectRealImageType(bytes) {
+  if (bytes.length < 12) return null;
+
+  // JPEG: dimulai dengan FF D8
+  if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
+
+  // PNG: dimulai dengan 89 50 4E 47 (‰PNG)
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) {
+    return 'image/png';
+  }
+
+  // GIF: dimulai dengan "GIF87a" atau "GIF89a"
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+
+  // WEBP: "RIFF"....'WEBP' -- 4 byte pertama RIFF, byte 8-11 WEBP
+  if (
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+
+  return null;
 }
 
 // Ambil string tanggal "hari ini" menurut WIB (UTC+7), format YYYY-MM-DD.
@@ -344,9 +403,19 @@ export default {
           );
         }
 
+        const bytes = new Uint8Array(await file.arrayBuffer());
+
+        // ---- Validasi isi file yang SEBENARNYA, bukan cuma klaim browser ----
+        // file.type dikirim dari sisi client dan gampang dipalsuin. Kita cek
+        // beberapa byte pertama file itu sendiri buat mastiin isinya beneran
+        // format gambar yang diklaim, sebelum disimpan ke R2.
+        const realType = detectRealImageType(bytes);
+        if (!realType || realType !== file.type) {
+          return json({ ok: false, error: 'Isi file tidak sesuai dengan format yang diklaim.' }, 400, cors);
+        }
+
         const id = newId();
         const filename = `${id}.${ext}`;
-        const bytes = new Uint8Array(await file.arrayBuffer());
 
         // ---- Auto-moderasi AI sebelum foto ditampilin publik ----
         const moderation = await moderateImage(env, bytes, file.type);
@@ -394,6 +463,10 @@ export default {
           headers: {
             'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
             'Cache-Control': 'public, max-age=31536000, immutable',
+            // Cegah browser lama "nyium" (sniff) isi file jadi beda dari
+            // Content-Type yang di-declare -- pertahanan tambahan di atas
+            // validasi magic bytes pas upload.
+            'X-Content-Type-Options': 'nosniff',
             ...cors,
           },
         });
