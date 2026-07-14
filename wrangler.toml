@@ -2,6 +2,21 @@ name = "public-poto-api"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
 
+# Custom domain buat API production. Ini yang sebelumnya ke-set lewat
+# dashboard tapi nggak ada di file lokal ini -- akibatnya waktu deploy
+# terakhir, wrangler override config remote dan route ini bisa kehapus.
+# Ditambahin balik di sini biar setiap deploy berikutnya route ini SELALU
+# ikut ke-set, nggak bergantung sama apa yang kebetulan ada di dashboard.
+routes = [
+  { pattern = "api.telehub.web.id", custom_domain = true }
+]
+
+# Matikan Preview URL (https://public-poto-api.<akun>.workers.dev). Tanpa ini,
+# Worker bisa diakses lewat URL workers.dev itu juga -- yang artinya orang bisa
+# curl langsung ke situ tanpa lewat CORS/domain check di browser. Kalau API ini
+# cuma dipakai lewat api.telehub.web.id, nggak perlu ada jalur tambahan ini.
+preview_urls = false
+
 kv_namespaces = [
   { binding = "PHOTOS_KV", id = "3480ddc6086749f795a0e370be55641e" }
 ]
